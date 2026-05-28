@@ -287,7 +287,7 @@ def build_singbox_config(nodes):
 
 def report_status(current_nodes, argo_urls):
     global last_reported_bytes
-    status = get_system_status()  # 获取全能深度状态
+    status = get_system_status()  # 抓取包含探针数据的全量状态
     status["ip"] = VPS_IP
     status["argo_urls"] = argo_urls
     
