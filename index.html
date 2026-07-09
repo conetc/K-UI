@@ -1228,10 +1228,22 @@
                 const resetUserTraffic = async (username) => { await fetchApi('/api/users', { method: 'PUT', body: JSON.stringify({ username, reset_traffic: true }) }); refreshData(); };
                 const addVps = async () => { if(!newVps.value.ip || !newVps.value.name) return alert('请输入名称和IP'); deployOsMap[newVps.value.ip] = newVps.value.os; saveOsMap(); await fetchApi('/api/vps', { method: 'POST', body: JSON.stringify({ ip: newVps.value.ip, name: newVps.value.name }) }); newVps.value = { name: '', ip: '', os: 'debian' }; refreshData(); fetchProbeData();};
                 const deleteVps = async (ip) => { if(confirm('🧨 确定移除该机器？该机器相关的探针数据、节点数据将被完全清空！')) { await fetchApi(`/api/vps?ip=${ip}`, { method: 'DELETE' }); refreshData(); fetchProbeData();} };
-                const updateVpsSocks5 = async (ip, field, value) => { await fetchApi('/api/vps', { method: 'PUT', body: JSON.stringify({ ip, [field]: value }) }); };
+                const updateVpsSocks5 = async (ip, field, value) => {
+                    const svr = servers.value.find(s => s.ip === ip);
+                    if (svr) svr[field] = value;
+                    await fetchApi('/api/vps', { method: 'PUT', body: JSON.stringify({ ip, [field]: value }) });
+                };
                 const socks5Categories = Object.freeze([{ key: 'youtube', label: '🌐 YouTube' }, { key: 'ai', label: '🤖 AI' }, { key: 'google', label: '🔍 谷歌搜索' }, { key: 'streaming', label: '🎬 流媒体' }]);
                 const socks5CatSelected = (vps, cat) => { try { const d = JSON.parse(vps.socks5_domains || '{}'); return Array.isArray(d.categories) && d.categories.includes(cat); } catch(e) { return false; } };
-                const toggleSocks5Cat = (vps, cat, on) => { let d = { categories: [] }; try { d = JSON.parse(vps.socks5_domains || '{}'); if (!Array.isArray(d.categories)) d.categories = []; } catch(e) { d = { categories: [] }; } if (on) { if (!d.categories.includes(cat)) d.categories.push(cat); } else { d.categories = d.categories.filter(c => c !== cat); } const raw = JSON.stringify(d); updateVpsSocks5(vps.ip, 'socks5_domains', raw); vps.socks5_domains = raw; };
+                const toggleSocks5Cat = (vps, cat, on) => {
+                    let d = { categories: [] };
+                    try { d = JSON.parse(vps.socks5_domains || '{}'); if (!Array.isArray(d.categories)) d.categories = []; } catch(e) { d = { categories: [] }; }
+                    if (on) { if (!d.categories.includes(cat)) d.categories.push(cat); } else { d.categories = d.categories.filter(c => c !== cat); }
+                    const raw = JSON.stringify(d);
+                    const svr = servers.value.find(s => s.ip === vps.ip);
+                    if (svr) svr.socks5_domains = raw;
+                    fetchApi('/api/vps', { method: 'PUT', body: JSON.stringify({ ip: vps.ip, socks5_domains: raw }) });
+                };
 
                 const addNode = async (ip) => {
                     const p = newNodeParams[ip]; if(!p.port) return alert('请填写端口!');
