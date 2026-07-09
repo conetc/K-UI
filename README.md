@@ -1,3 +1,6 @@
+DEV修复情况
+2026/07/09  已修复clash订阅问题
+
 # ⚡ KUI x Server Monitor Pro - 无服务器集群网关
 
 ![Vue 3](https://img.shields.io/badge/Frontend-Vue%203-4FC08D?logo=vuedotjs)
