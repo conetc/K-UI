@@ -785,7 +785,7 @@ async function proxyLocal(method, subPath, req, env) {
     }
 
     if (subPath === 'nodes' && method === 'GET') {
-        const cutoff = Date.now() - 360000;
+        const cutoff = Date.now() - 1800000;
         const { results } = await db.prepare(`SELECT s.ip, s.details, s.last_seen, l.logs FROM proxy_ctrl_servers s LEFT JOIN server_logs l ON s.ip = l.ip WHERE s.last_seen >= ? ORDER BY s.last_seen DESC`).bind(cutoff).all();
         return new Response(JSON.stringify(results || []), { headers: { 'Content-Type': 'application/json' } });
     }
