@@ -933,7 +933,6 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             raise RuntimeError("WARP cannot be combined with residential mesh routing")
         if socks5_outbound and socks5_outbound.get("enabled"):
             raise RuntimeError("SOCKS5 outbound and WARP outbound cannot be enabled together")
-        subprocess.run(["modprobe", "wireguard"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         profile = _load_or_create_warp_profile()
         addresses = []
         allowed_ips = []
@@ -944,7 +943,7 @@ def build_singbox_config(nodes, proxy_cfg=None, peers=None, mesh=None, socks5_ou
             addresses.append(profile["ipv6_address"])
             allowed_ips.append("::/0")
         singbox_config["endpoints"] = [{
-            "type": "wireguard", "tag": "warp-out", "system": True,
+            "type": "wireguard", "tag": "warp-out", "system": False,
             "mtu": min(max(int(profile.get("mtu", 1280)), 1280), 1420),
             "address": addresses, "private_key": profile["private_key"],
             "peers": [{
