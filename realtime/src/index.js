@@ -12,6 +12,15 @@ const SNAPSHOT_CACHE_MS = 10_000;
 const MAX_PUBLIC_SOCKETS = 5;
 const MAX_PUBLIC_SOCKETS_PER_IP = 1;
 const MAX_DASHBOARD_SOCKETS = 5;
+const DEFAULT_FREQUENCY_POLICY = { admin: ADMIN_STATUS_INTERVAL, public: PUBLIC_STATUS_INTERVAL, idle: IDLE_STATUS_INTERVAL };
+
+function validFrequencyPolicy(value) {
+  const admin = Number(value?.admin);
+  const publicInterval = Number(value?.public);
+  const idle = Number(value?.idle);
+  if (!Number.isInteger(admin) || !Number.isInteger(publicInterval) || !Number.isInteger(idle) || admin < 5 || admin > 60 || publicInterval < 10 || publicInterval > 120 || idle < 30 || idle > 600 || publicInterval < admin || idle < publicInterval) return null;
+  return { admin: admin * 1000, public: publicInterval * 1000, idle: idle * 1000 };
+}
 
 function viewerActive(attachment, now = Date.now()) { return Number(attachment?.lastActivity || 0) + VIEWER_LEASE_MS > now; }
 
@@ -147,6 +156,15 @@ export default {
       const body = await request.json().catch(() => ({}));
       const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName("main"));
       const response = await hub.fetch(new Request("https://hub.internal/public-policy", { method: "POST", headers: { "X-KUI-Public": body.public === true ? "1" : "0" } }));
+      return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
+    }
+
+    if (url.pathname === "/frequency-policy" && request.method === "POST") {
+      if (!(await verifyAdmin(request.headers.get("Authorization"), env))) return json({ error: "Forbidden" }, 403, cors(request, env));
+      const policy = validFrequencyPolicy(await request.json().catch(() => null));
+      if (!policy) return json({ error: "Invalid frequency policy" }, 400, cors(request, env));
+      const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName("main"));
+      const response = await hub.fetch(new Request("https://hub.internal/frequency-policy", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ admin: policy.admin / 1000, public: policy.public / 1000, idle: policy.idle / 1000 }) }));
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...cors(request, env) } });
     }
 
@@ -371,10 +389,14 @@ export class DashboardHub extends DurableObject {
     try { ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong")); } catch {}
     this.activityUntil = 0;
     this.activityInterval = IDLE_STATUS_INTERVAL;
+    this.frequencyPolicy = DEFAULT_FREQUENCY_POLICY;
     this.publicPolicyAllowed = false;
     this.publicPolicyCheckedAt = 0;
     this.snapshotCache = null;
     this.snapshotCachedAt = 0;
+    ctx.blockConcurrencyWhile(async () => {
+      this.frequencyPolicy = validFrequencyPolicy(await ctx.storage.get("frequencyPolicy")) || DEFAULT_FREQUENCY_POLICY;
+    });
   }
 
   async fetch(request) {
@@ -387,7 +409,7 @@ export class DashboardHub extends DurableObject {
     }
     if (url.pathname === "/active") {
       const interval = this.viewerInterval();
-      const active = interval < IDLE_STATUS_INTERVAL;
+      const active = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
       return json({ active, interval_seconds: interval / 1000, until: active ? Date.now() + VIEWER_LEASE_MS : 0 });
     }
     if (url.pathname === "/ws") {
@@ -429,6 +451,14 @@ export class DashboardHub extends DurableObject {
         }
       }
       return json({ success: true });
+    }
+    if (url.pathname === "/frequency-policy" && request.method === "POST") {
+      const policy = validFrequencyPolicy(await request.json().catch(() => null));
+      if (!policy) return json({ error: "Invalid frequency policy" }, 400);
+      this.frequencyPolicy = policy;
+      await this.ctx.storage.put("frequencyPolicy", { admin: policy.admin / 1000, public: policy.public / 1000, idle: policy.idle / 1000 });
+      await this.setDashboardActivity();
+      return json({ success: true, policy: { admin: policy.admin / 1000, public: policy.public / 1000, idle: policy.idle / 1000 } });
     }
     if (url.pathname === "/update" && request.method === "POST") {
       if (request.headers.get("X-KUI-Presence") !== "1") return json({ error: "Forbidden" }, 403);
@@ -521,14 +551,14 @@ export class DashboardHub extends DurableObject {
   }
 
   viewerInterval() {
-    if (this.ctx.getWebSockets("dashboard").length) return ADMIN_STATUS_INTERVAL;
-    if (this.ctx.getWebSockets("public").length) return PUBLIC_STATUS_INTERVAL;
-    return IDLE_STATUS_INTERVAL;
+    if (this.ctx.getWebSockets("dashboard").length) return this.frequencyPolicy.admin;
+    if (this.ctx.getWebSockets("public").length) return this.frequencyPolicy.public;
+    return this.frequencyPolicy.idle;
   }
 
   async setDashboardActivity() {
     const interval = this.viewerInterval();
-    const active = interval < IDLE_STATUS_INTERVAL;
+    const active = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
     const until = active ? Date.now() + VIEWER_LEASE_MS : 0;
     if (this.activityInterval === interval && (!active || this.activityUntil - Date.now() > 60000)) return;
     this.activityUntil = until;
@@ -561,7 +591,7 @@ export class DashboardHub extends DurableObject {
       else if (!next || value.expires < next) next = value.expires;
     }
     if (expired.length) await this.ctx.storage.delete(expired);
-    const hasActiveViewers = this.viewerInterval() < IDLE_STATUS_INTERVAL;
+    const hasActiveViewers = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
     if (!hasActiveViewers) await this.setDashboardActivity();
     const publicSockets = this.ctx.getWebSockets("public");
     if (publicSockets.length) {

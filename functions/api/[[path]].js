@@ -112,6 +112,26 @@ async function notifyRealtimePublicPolicy(env, db, enabled) {
     });
 }
 
+function realtimeFrequencyPolicy(settings = {}) {
+    const admin = Number(settings.realtime_admin_interval || 5);
+    const publicInterval = Number(settings.realtime_public_interval || 10);
+    const idle = Number(settings.realtime_idle_interval || 30);
+    if (!Number.isInteger(admin) || !Number.isInteger(publicInterval) || !Number.isInteger(idle) || admin < 5 || admin > 60 || publicInterval < 10 || publicInterval > 120 || idle < 30 || idle > 600 || publicInterval < admin || idle < publicInterval) return null;
+    return { admin, public: publicInterval, idle };
+}
+
+async function notifyRealtimeFrequencyPolicy(env, db, settings) {
+    const policy = realtimeFrequencyPolicy(settings);
+    const authorization = await realtimeAdminHeader(env);
+    const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
+    if (!policy || !authorization || !configured || !/^https:\/\//i.test(configured)) return;
+    await fetch(`${configured.replace(/\/$/, '')}/frequency-policy`, {
+        method: 'POST',
+        headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+        body: JSON.stringify(policy),
+    });
+}
+
 async function notifyRealtimeVps(env, db, ip) {
     const authorization = await realtimeAdminHeader(env);
     const configured = env.REALTIME_URL || (await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first())?.val;
@@ -735,8 +755,16 @@ async function handleProbeAPI(request, env, context, pathArray) {
     if (method === 'POST' && subPath === 'admin/settings') {
         const { settings } = await readJsonBody(request, 64 * 1024);
         if (!settings || typeof settings !== 'object' || Array.isArray(settings) || Object.keys(settings).length > 80) return Response.json({ error: 'Invalid settings' }, { status: 400 });
+        const frequencyKeys = ['realtime_admin_interval', 'realtime_public_interval', 'realtime_idle_interval'];
+        let frequencySettings = settings;
+        if (frequencyKeys.some(key => Object.prototype.hasOwnProperty.call(settings, key))) {
+            const { results } = await db.prepare("SELECT key, value FROM probe_settings WHERE key IN ('realtime_admin_interval', 'realtime_public_interval', 'realtime_idle_interval')").all();
+            frequencySettings = { ...Object.fromEntries((results || []).map(row => [row.key, row.value])), ...settings };
+            if (!realtimeFrequencyPolicy(frequencySettings)) return Response.json({ error: 'Invalid realtime frequency policy' }, { status: 400 });
+        }
         for (const [k, v] of Object.entries(settings)) { await db.prepare('INSERT INTO probe_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(k, v).run(); }
         if (Object.prototype.hasOwnProperty.call(settings, 'is_public')) await notifyRealtimePublicPolicy(env, db, settings.is_public === 'true').catch(() => {});
+        if (frequencyKeys.some(key => Object.prototype.hasOwnProperty.call(settings, key))) await notifyRealtimeFrequencyPolicy(env, db, frequencySettings).catch(() => {});
         if (settings.tg_bot_token) {
             try {
                await fetch(`https://api.telegram.org/bot${settings.tg_bot_token}/setWebhook`, {
