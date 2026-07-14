@@ -383,9 +383,8 @@ export class DashboardHub extends DurableObject {
       return json({ ticket, expires_in: 60 });
     }
     if (url.pathname === "/active") {
-      const now = Date.now();
-      const active = [...this.ctx.getWebSockets()].some(ws => viewerActive(ws.deserializeAttachment(), now));
-      return json({ active, until: active ? now + VIEWER_LEASE_MS : 0 });
+      const active = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
+      return json({ active, until: active ? Date.now() + VIEWER_LEASE_MS : 0 });
     }
     if (url.pathname === "/ws") {
       const ticket = url.searchParams.get("ticket") || "";
@@ -549,9 +548,7 @@ export class DashboardHub extends DurableObject {
       else if (!next || value.expires < next) next = value.expires;
     }
     if (expired.length) await this.ctx.storage.delete(expired);
-    const nowActive = Date.now();
-    for (const ws of this.ctx.getWebSockets()) if (!viewerActive(ws.deserializeAttachment(), nowActive)) { try { ws.close(1001, "activity timeout"); } catch {} }
-    const hasActiveViewers = [...this.ctx.getWebSockets()].some(ws => viewerActive(ws.deserializeAttachment(), nowActive));
+    const hasActiveViewers = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
     if (!hasActiveViewers) await this.setDashboardActivity(false);
     const publicSockets = this.ctx.getWebSockets("public");
     if (publicSockets.length) {
