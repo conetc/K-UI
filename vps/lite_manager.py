@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, urllib.parse, json, ipaddress, hashlib, sys, re
+import base64, csv, os, subprocess, threading, time, urllib.request, urllib.parse, json, ipaddress, hashlib, hmac, sys, re
 from collections import deque
 from pathlib import Path
 import proxy_server
@@ -14,10 +14,13 @@ except ImportError:
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = os.environ.get("C2_URL", "https://YOUR_CONTROLLER_DOMAIN")
+UPDATE_ORIGIN = os.environ.get("UPDATE_ORIGIN", "")
 # 控制器 API 前缀：本地 (CF Pages) 控制器为 /api/proxy；独立部署的原版控制器为 /api
 C2_API_PREFIX = os.environ.get("C2_API_PREFIX", "/api/proxy")
 if urllib.parse.urlsplit(C2_URL).scheme != "https":
     raise RuntimeError("C2_URL must use HTTPS")
+if UPDATE_ORIGIN and urllib.parse.urlsplit(UPDATE_ORIGIN).scheme != "https":
+    raise RuntimeError("UPDATE_ORIGIN must use HTTPS")
 if C2_API_PREFIX not in {"/api", "/api/proxy"}:
     raise RuntimeError("invalid C2_API_PREFIX")
 
@@ -128,12 +131,18 @@ def check_for_updates():
     temporary_files = []
     try:
         for component, target in components:
-            url = f"{C2_URL.rstrip('/')}/api/agent_update?ip={urllib.parse.quote(VPS_IP, safe='')}&component={component}"
+            if not UPDATE_ORIGIN: raise ValueError("UPDATE_OR is required for updates")
+            url = f"{UPDATE_ORIGIN.rstrip('/')}/api/agent_update?ip={urllib.parse.quote(VPS_IP, safe='')}&component={component}"
             request = urllib.request.Request(url, headers=get_c2_headers())
             with urllib.request.urlopen(request, timeout=20) as response:
                 source = response.read(2 * 1024 * 1024 + 1)
                 expected = response.headers.get("X-Agent-SHA256", "").lower()
-            if len(source) > 2 * 1024 * 1024 or not re.fullmatch(r"[0-9a-f]{64}", expected) or hashlib.sha256(source).hexdigest() != expected:
+                version = response.headers.get("X-Agent-Manifest-Version", "")
+                length = response.headers.get("X-Agent-Length", "")
+                supplied_mac = response.headers.get("X-Agent-MAC", "").lower()
+            manifest = f"v1\n{component}\n{expected}\n{len(source)}\n".encode()
+            expected_mac = hmac.new(AGENT_TOKEN.encode(), manifest, hashlib.sha256).hexdigest()
+            if len(source) > 2 * 1024 * 1024 or version != "1" or length != str(len(source)) or not re.fullmatch(r"[0-9a-f]{64}", expected) or not hmac.compare_digest(supplied_mac, expected_mac) or hashlib.sha256(source).hexdigest() != expected:
                 raise ValueError(f"{component} checksum mismatch")
             if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == expected:
                 continue
@@ -158,7 +167,7 @@ def check_for_updates():
                 if backup.exists(): target.write_bytes(backup.read_bytes()); target.chmod(0o700)
             raise
         marker = WORKSPACE / ".update-pending"
-        marker.write_text(str(int(time.time()))); marker.chmod(0o600)
+        marker.write_text(json.dumps({"updated_at": int(time.time()), "deadline_at": int(time.time()) + 120})); marker.chmod(0o600)
         print("[update] residential proxy components updated; restarting", flush=True)
         subprocess.run(["pkill", "-f", "openvpn.*tun_main"], capture_output=True)
         subprocess.run(["pkill", "-f", "openvpn.*tun_backup"], capture_output=True)
@@ -751,8 +760,13 @@ def main():
     threading.Thread(target=run_proxy_server, daemon=True).start()
     threading.Thread(target=health_check_loop, daemon=True).start()
     threading.Thread(target=c2_heartbeat_loop, daemon=True).start()
-    try: (WORKSPACE / ".update-pending").unlink()
-    except FileNotFoundError: pass
+    marker = WORKSPACE / ".update-pending"
+    if marker.exists():
+        if not initial or not proxy_server.listener_ready.wait(30):
+            print("[proxy] updated version failed controller readiness", flush=True)
+            raise SystemExit(1)
+        try: marker.unlink()
+        except FileNotFoundError: pass
     maintain_pool()
 
 if __name__ == "__main__":

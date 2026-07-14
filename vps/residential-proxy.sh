@@ -71,9 +71,9 @@ detect_pkg_manager() {
 }
 
 detect_init_system() {
-    if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1; then
+    if [ -d /run/systemd/system ] && [ "$(cat /proc/1/comm 2>/dev/null || true)" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then
         echo "systemd"
-    elif [ -f /sbin/openrc-run ] || [ -d /etc/init.d ]; then
+    elif [ -x /sbin/openrc-run ] && command -v rc-service >/dev/null 2>&1; then
         echo "openrc"
     else
         echo ""
@@ -91,9 +91,7 @@ if [ -z "$PKG_MGR" ]; then
     exit 1
 fi
 
-if [ -z "$INIT_SYS" ]; then
-    echo "⚠️  警告: 未识别初始化系统，将尝试手动启动代理进程"
-fi
+if [ -z "$INIT_SYS" ]; then echo "❌ 需要正在运行的 systemd 或 OpenRC"; exit 1; fi
 
 install_dependencies() {
     echo "[0/4] 安装系统依赖..."
@@ -101,18 +99,18 @@ install_dependencies() {
         apt)
             apt-get update -q || { echo "❌ apt-get update 失败"; exit 1; }
             apt-get install -y --no-install-recommends \
-                openvpn python3 python3-websocket curl iproute2 iptables cron psmisc \
+                openvpn python3 python3-websocket curl openssl iproute2 iptables cron psmisc \
                 || { echo "❌ 依赖安装失败"; exit 1; }
             ;;
         apk)
             apk update || true
             apk add --no-cache \
-                openvpn python3 py3-websocket-client curl iproute2 iptables dcron psmisc \
+                openvpn python3 py3-websocket-client curl openssl iproute2 iptables dcron psmisc \
                 || { echo "❌ apk 依赖安装失败"; exit 1; }
             ;;
         yum|dnf)
             $PKG_MGR install -y \
-                openvpn python3 curl iproute2 iptables cron psmisc \
+                openvpn python3 curl openssl iproute2 iptables cron psmisc \
                 || { echo "❌ $PKG_MGR 依赖安装失败"; exit 1; }
             $PKG_MGR install -y python3-websocket-client >/dev/null 2>&1 || echo "⚠️ 未找到 python3-websocket-client，将使用 HTTP 备份模式。"
             ;;
@@ -173,12 +171,22 @@ download_agents() {
     mkdir -p /opt/proxy_lite/configs
     cd /opt/proxy_lite
 
+    verify_agent_manifest() {
+        COMPONENT="$1"; FILE="$2"; HEADERS="$3"
+        EXPECTED_SHA=$(tr -d '\r' < "$HEADERS" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
+        VERSION=$(tr -d '\r' < "$HEADERS" | awk '/^[Xx]-[Aa]gent-[Mm]anifest-[Vv]ersion:/ {print $2}' | tail -n 1)
+        EXPECTED_LENGTH=$(tr -d '\r' < "$HEADERS" | awk '/^[Xx]-[Aa]gent-[Ll]ength:/ {print $2}' | tail -n 1)
+        SUPPLIED_MAC=$(tr -d '\r' < "$HEADERS" | awk '/^[Xx]-[Aa]gent-[Mm][Aa][Cc]:/ {print tolower($2)}' | tail -n 1)
+        ACTUAL_SHA=$(sha256sum "$FILE" | awk '{print $1}')
+        ACTUAL_LENGTH=$(wc -c < "$FILE" | tr -d ' ')
+        EXPECTED_MAC=$(printf 'v1\n%s\n%s\n%s\n' "$COMPONENT" "$EXPECTED_SHA" "$ACTUAL_LENGTH" | openssl dgst -sha256 -mac HMAC -macopt "key:${AGENT_TOKEN}" | awk '{print tolower($NF)}')
+        [ "$VERSION" = "1" ] && [ "$EXPECTED_LENGTH" = "$ACTUAL_LENGTH" ] && [ "$EXPECTED_SHA" = "$ACTUAL_SHA" ] && [ -n "$SUPPLIED_MAC" ] && [ "$SUPPLIED_MAC" = "$EXPECTED_MAC" ]
+    }
+
     download_component() {
         COMPONENT="$1"; TARGET="$2"; TEMP_FILE="${TARGET}.download"; HEADER_FILE="${TARGET}.headers"
         curl -fSL --retry 3 --retry-delay 2 -D "$HEADER_FILE" -H "Authorization: ${AGENT_TOKEN}" -o "$TEMP_FILE" "${DOMAIN}/api/agent_update?ip=${VPS_IP}&component=${COMPONENT}" || return 1
-        EXPECTED_SHA=$(tr -d '\r' < "$HEADER_FILE" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
-        ACTUAL_SHA=$(sha256sum "$TEMP_FILE" | awk '{print $1}')
-        [ -n "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" = "$ACTUAL_SHA" ] || { echo "❌ ${COMPONENT} SHA256 校验失败"; return 1; }
+        verify_agent_manifest "$COMPONENT" "$TEMP_FILE" "$HEADER_FILE" || { echo "❌ ${COMPONENT} 更新清单校验失败"; return 1; }
         mv "$TEMP_FILE" "$TARGET"
         rm -f "$HEADER_FILE"
     }
@@ -204,6 +212,7 @@ install_service() {
     if [ "$CONTROLLER" = "$DOMAIN" ]; then C2_API_PREFIX="/api/proxy"; else C2_API_PREFIX="/api"; fi
     cat > /etc/proxy-lite/env << EOF
 C2_URL="${CONTROLLER}"
+UPDATE_ORIGIN="${DOMAIN}"
 C2_API_PREFIX="${C2_API_PREFIX}"
 WEB_USER_B64="${WEB_USER_B64}"
 WEB_PASS_B64="${WEB_PASS_B64}"

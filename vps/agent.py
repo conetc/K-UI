@@ -13,6 +13,7 @@ import platform
 import tempfile
 import shutil
 import hashlib
+import hmac
 import threading
 import configparser
 import ipaddress
@@ -311,7 +312,12 @@ def check_for_update():
             with urllib.request.urlopen(request, timeout=20) as response:
                 source = response.read(2 * 1024 * 1024 + 1)
                 expected_hash = response.headers.get("X-Agent-SHA256", "").lower()
-            if not source or len(source) > 2 * 1024 * 1024 or not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or hashlib.sha256(source).hexdigest() != expected_hash:
+                version = response.headers.get("X-Agent-Manifest-Version", "")
+                length = response.headers.get("X-Agent-Length", "")
+                supplied_mac = response.headers.get("X-Agent-MAC", "").lower()
+            manifest = f"v1\n{component}\n{expected_hash}\n{len(source)}\n".encode()
+            expected_mac = hmac.new(TOKEN.encode(), manifest, hashlib.sha256).hexdigest()
+            if not source or len(source) > 2 * 1024 * 1024 or version != "1" or length != str(len(source)) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or not hmac.compare_digest(supplied_mac, expected_mac) or hashlib.sha256(source).hexdigest() != expected_hash:
                 raise ValueError(f"{component} update checksum mismatch")
             current_hash = hashlib.sha256(open(target, "rb").read()).hexdigest() if os.path.exists(target) else ""
             if current_hash == expected_hash:
@@ -332,7 +338,7 @@ def check_for_update():
             for target, backup in reversed(replaced):
                 if os.path.exists(backup): shutil.copy2(backup, target)
             raise
-        _write_json_state("/opt/kui/.update-pending", {"updated_at": int(time.time()), "files": [target for _, target in changed]})
+        _write_json_state("/opt/kui/.update-pending", {"updated_at": int(time.time()), "deadline_at": int(time.time()) + 120, "files": [target for _, target in changed]})
         print("[agent] components updated, restarting", flush=True)
         os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
     except Exception as error:
@@ -529,14 +535,9 @@ def get_port_traffic(port, protocol="tcp", node_id=None):
         except Exception:
             pass
 
-    # 兜底：iptables 单端口累计字节（真正的单节点计量）。
-    # 注意：绝不能回退到"系统全网卡总流量"——那样每个节点都会拿到同一个总量，
-    # report_status 里逐节点累加会把用户流量放大 N 倍（N=节点数）。
-    port_bytes = _read_iptables_port_bytes(port, protocol)
-    if port_bytes is not None:
-        return port_bytes
-
-    return 0
+    # Firewall counters include unauthenticated probes and are not reliable
+    # per-user billing data. Fail closed until sing-box stats are available.
+    return None
 
 def get_system_status(current_interval):
     global prev_cpu_total, prev_cpu_idle, prev_rx, prev_tx, loop_counter, last_pings
@@ -1053,6 +1054,8 @@ def report_status(current_nodes, argo_urls, force_http=False, allow_http=True):
         current_ids.add(nid)
         proto = "udp" if node["protocol"] in ["Hysteria2", "TUIC"] else "tcp"
         current_bytes = get_port_traffic(port, proto, nid)
+        if current_bytes is None:
+            continue
         baseline = pending_bytes.get(nid, current_bytes)
         delta = current_bytes - baseline if current_bytes >= baseline else current_bytes
         if delta > 0: deltas.append({ "id": nid, "delta_bytes": delta })
@@ -1217,8 +1220,8 @@ def fetch_and_apply_configs():
                 realtime_channel.start()
             nodes = data.get("configs", [])
             global current_proxy_config
-            current_proxy_config = {}
-            mesh = {"enabled": False}
+            current_proxy_config = data.get("proxy") if isinstance(data.get("proxy"), dict) else {}
+            mesh = _extract_mesh(current_proxy_config)
             peers = []
             if mesh.get("enabled"):
                 peers = fetch_proxy_mesh(mesh.get("country", "ANY"))
@@ -1352,9 +1355,15 @@ if __name__ == "__main__":
             heartbeat_wakeup.clear()
 
     time.sleep(2)
+    initial_nodes = fetch_and_apply_configs()
+    if os.path.exists("/opt/kui/.update-pending"):
+        if initial_nodes is None or not _singbox_service_healthy() or not report_status(list(initial_nodes), [], force_http=True):
+            print("[agent] updated version failed readiness checks", flush=True)
+            raise SystemExit(1)
+        try: os.remove("/opt/kui/.update-pending")
+        except FileNotFoundError: pass
+    if initial_nodes is not None: heartbeat_state["nodes"] = initial_nodes
     threading.Thread(target=heartbeat_loop, name="kui-heartbeat", daemon=True).start()
-    try: os.remove("/opt/kui/.update-pending")
-    except FileNotFoundError: pass
     while True:
         config_wakeup.clear()
         while realtime_channel and realtime_channel.enabled and not realtime_channel.connected:

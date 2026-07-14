@@ -5,6 +5,14 @@ import { DurableObject } from "cloudflare:workers";
 const ACTIVE_STATUS_INTERVAL = 5_000;
 const IDLE_STATUS_INTERVAL = 30_000;
 const STATUS_STALE_AFTER = 20_000;
+const VIEWER_LEASE_MS = 90_000;
+const RESYNC_COOLDOWN_MS = 30_000;
+const SNAPSHOT_CACHE_MS = 10_000;
+const MAX_PUBLIC_SOCKETS = 5;
+const MAX_PUBLIC_SOCKETS_PER_IP = 1;
+const MAX_DASHBOARD_SOCKETS = 5;
+
+function viewerActive(attachment, now = Date.now()) { return Number(attachment?.lastActivity || 0) + VIEWER_LEASE_MS > now; }
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -46,7 +54,7 @@ function compactRoleState(role, data) {
     const keys = ["cpu", "mem", "disk", "load", "uptime", "net_in_speed", "net_out_speed", "tcp_conn", "udp_conn", "os", "arch"];
     return Object.fromEntries(keys.filter(key => data?.[key] !== undefined).map(key => [key, data[key]]));
   }
-  return { details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: item.tunnel, active: item.active, node_ip: item.node_ip, exit_ip: item.exit_ip, country: item.country, ready: item.ready })) : [] };
+  return { details: Array.isArray(data?.details) ? data.details.slice(0, 4).map(item => ({ tunnel: String(item?.tunnel || "").slice(0, 32), active: item?.active === true, node_ip: String(item?.node_ip || "").slice(0, 64), exit_ip: String(item?.exit_ip || "").slice(0, 64), country: String(item?.country || "").slice(0, 2), port: Number(item?.port) || 0, ready: item?.ready === true, connected_time: Math.max(0, Math.min(Number(item?.connected_time) || 0, 31536000)) })) : [] };
 }
 
 async function verifyAdmin(header, env) {
@@ -112,7 +120,7 @@ export default {
       const setting = await env.DB.prepare("SELECT value FROM probe_settings WHERE key = 'is_public'").first();
       if (setting && setting.value !== "true") return json({ error: "Private dashboard" }, 403);
       const hub = env.DASHBOARD_HUB.get(env.DASHBOARD_HUB.idFromName("main"));
-      return hub.fetch(doRequest("/public-ws", request));
+      return hub.fetch(doRequest("/public-ws", request, { "X-KUI-CLIENT-IP": request.headers.get("CF-Connecting-IP") || "unknown" }));
     }
 
     if (url.pathname === "/dashboard/snapshot") {
@@ -208,7 +216,7 @@ export class VpsPresence extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message !== "string" || message.length > 1024 * 1024) return;
+    if (typeof message !== "string" || message.length > 64 * 1024) return;
     let envelope;
     try { envelope = JSON.parse(message); } catch { return; }
     const attachment = ws.deserializeAttachment() || {};
@@ -233,7 +241,7 @@ export class VpsPresence extends DurableObject {
       return;
     }
     if (messageType === "config.result") {
-      this.snapshot[`${role}_config_result`] = envelope.data || {};
+      this.snapshot[`${role}_config_result`] = { success: envelope.data?.success === true, component: String(envelope.data?.component || "").slice(0, 32), error: String(envelope.data?.error || "").slice(0, 500), applied_at: Number(envelope.data?.applied_at) || Date.now() };
       this.snapshot[`${role}_config_result_at`] = Date.now();
       ws.serializeAttachment(attachment);
       await this.persistAndBroadcast();
@@ -241,7 +249,7 @@ export class VpsPresence extends DurableObject {
     }
     if (messageType !== "status") return;
     const previousRoleState = this.snapshot[role];
-    const nextRoleState = envelope.data || {};
+    const nextRoleState = compactRoleState(role, envelope.data || {});
     const criticalChange = !previousRoleState || (role === "proxy" && JSON.stringify((previousRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])) !== JSON.stringify((nextRoleState.details || []).map(item => [item.tunnel, item.active, item.node_ip])));
     attachment.lastSeen = Date.now();
     attachment.state = compactRoleState(role, nextRoleState);
@@ -255,7 +263,8 @@ export class VpsPresence extends DurableObject {
       this.lastPersisted = Date.now();
       await this.ctx.storage.put("state", { snapshot: this.snapshot, lastSeq: this.lastSeq, bootId: this.bootId, persistedAt: this.lastPersisted });
     }
-    const statusBroadcastDue = this.dashboardActive && role === "core" && Date.now() - this.lastStatusBroadcast >= ACTIVE_STATUS_INTERVAL;
+    if (Date.now() >= this.dashboardActiveUntil) await this.refreshDashboardActivity();
+    const statusBroadcastDue = this.dashboardActive && Date.now() - this.lastStatusBroadcast >= ACTIVE_STATUS_INTERVAL;
     if (statusBroadcastDue) this.lastStatusBroadcast = Date.now();
     if (statusBroadcastDue || criticalChange) await this.broadcast();
   }
@@ -286,6 +295,17 @@ export class VpsPresence extends DurableObject {
     const interval = active ? ACTIVE_STATUS_INTERVAL : IDLE_STATUS_INTERVAL;
     for (const ws of this.ctx.getWebSockets()) {
       try { ws.send(JSON.stringify({ type: "status.interval", seconds: interval / 1000 })); } catch {}
+    }
+  }
+
+  async refreshDashboardActivity() {
+    const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName("main"));
+    try {
+      const response = await hub.fetch(new Request("https://hub.internal/active"));
+      const active = response.ok ? await response.json() : null;
+      this.setDashboardActivity(active?.active === true, Number(active?.until) || Date.now() + IDLE_STATUS_INTERVAL);
+    } catch {
+      this.setDashboardActivity(false, Date.now() + IDLE_STATUS_INTERVAL);
     }
   }
 
@@ -329,17 +349,7 @@ export class VpsPresence extends DurableObject {
 
   async broadcast() {
     const hub = this.env.DASHBOARD_HUB.get(this.env.DASHBOARD_HUB.idFromName("main"));
-    if (Date.now() >= this.dashboardActiveUntil) {
-      try {
-        const response = await hub.fetch(new Request("https://hub.internal/active"));
-        const active = response.ok ? await response.json() : null;
-        this.setDashboardActivity(active?.active === true, Number(active?.until) || Date.now() + 300000);
-      } catch {
-        this.dashboardActive = false;
-        this.dashboardActiveUntil = Date.now() + 300000;
-        return;
-      }
-    }
+    if (Date.now() >= this.dashboardActiveUntil) await this.refreshDashboardActivity();
     if (!this.dashboardActive) return;
     await hub.fetch(new Request("https://hub.internal/update", {
       method: "POST",
@@ -358,6 +368,8 @@ export class DashboardHub extends DurableObject {
     this.activityUntil = 0;
     this.publicPolicyAllowed = false;
     this.publicPolicyCheckedAt = 0;
+    this.snapshotCache = null;
+    this.snapshotCachedAt = 0;
   }
 
   async fetch(request) {
@@ -369,8 +381,9 @@ export class DashboardHub extends DurableObject {
       return json({ ticket, expires_in: 60 });
     }
     if (url.pathname === "/active") {
-      const active = this.ctx.getWebSockets("dashboard").length + this.ctx.getWebSockets("public").length > 0;
-      return json({ active, until: active ? Date.now() + 300000 : 0 });
+      const now = Date.now();
+      const active = [...this.ctx.getWebSockets()].some(ws => viewerActive(ws.deserializeAttachment(), now));
+      return json({ active, until: active ? now + VIEWER_LEASE_MS : 0 });
     }
     if (url.pathname === "/ws") {
       const ticket = url.searchParams.get("ticket") || "";
@@ -382,16 +395,21 @@ export class DashboardHub extends DurableObject {
       await this.ctx.storage.delete(`ticket:${ticket}`);
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ user: record.user, connected_at: Date.now() });
+      if (this.ctx.getWebSockets("dashboard").length >= MAX_DASHBOARD_SOCKETS) return json({ error: "Too many dashboard connections" }, 429);
+      server.serializeAttachment({ user: record.user, connected_at: Date.now(), lastActivity: Date.now(), lastResync: 0 });
       this.ctx.acceptWebSocket(server, ["dashboard"]);
       await this.setDashboardActivity(true);
+      await this.ctx.storage.setAlarm(Date.now() + 30000);
       server.send(JSON.stringify({ type: "snapshot", data: await this.snapshot(), ts: Date.now() }));
       return new Response(null, { status: 101, webSocket: client });
     }
     if (url.pathname === "/public-ws") {
+      const clientIp = request.headers.get("X-KUI-CLIENT-IP") || "unknown";
+      const publicSockets = this.ctx.getWebSockets("public");
+      if (publicSockets.length >= MAX_PUBLIC_SOCKETS || publicSockets.filter(ws => ws.deserializeAttachment()?.clientIp === clientIp).length >= MAX_PUBLIC_SOCKETS_PER_IP) return json({ error: "Too many public connections" }, 429);
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.serializeAttachment({ public: true, connected_at: Date.now() });
+      server.serializeAttachment({ public: true, clientIp, connected_at: Date.now(), lastActivity: Date.now(), lastResync: 0 });
       this.ctx.acceptWebSocket(server, ["public"]);
       await this.setDashboardActivity(true);
       await this.ctx.storage.setAlarm(Date.now() + 60000);
@@ -430,6 +448,7 @@ export class DashboardHub extends DurableObject {
   }
 
   async snapshot() {
+    if (this.snapshotCache && Date.now() - this.snapshotCachedAt < SNAPSHOT_CACHE_MS) return this.snapshotCache;
     const servers = (await this.env.DB.prepare("SELECT ip, cpu, mem, disk, load, uptime, net_in_speed, net_out_speed, tcp_conn, udp_conn, last_report FROM servers").all()).results || [];
     const proxies = (await this.env.DB.prepare("SELECT ip, details, last_seen FROM proxy_ctrl_servers").all()).results || [];
     const proxyMap = new Map(proxies.map(row => [row.ip, row]));
@@ -454,22 +473,29 @@ export class DashboardHub extends DurableObject {
         updated_at: Math.max(row.last_report || 0, proxy?.last_seen || 0),
       };
     }));
-    return snapshots.filter(Boolean);
+    this.snapshotCache = snapshots.filter(Boolean);
+    this.snapshotCachedAt = Date.now();
+    return this.snapshotCache;
   }
 
   async webSocketMessage(ws, message) {
     if (message === "ping") {
+      const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
       ws.send("pong");
       return;
     }
     try {
       const parsed = JSON.parse(message);
       if (parsed?.type === "resync") {
+        const attachment = ws.deserializeAttachment() || {};
+        if (Date.now() - Number(attachment.lastResync || 0) < RESYNC_COOLDOWN_MS) return;
+        attachment.lastResync = Date.now(); attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
         const snapshots = await this.snapshot();
         const isPublic = ws.deserializeAttachment()?.public === true;
         ws.send(JSON.stringify({ type: "snapshot", data: isPublic ? snapshots.map(sanitizeSnapshot).filter(Boolean) : snapshots, ts: Date.now() }));
       }
       if (parsed?.type === "activity") {
+        const attachment = ws.deserializeAttachment() || {}; attachment.lastActivity = Date.now(); ws.serializeAttachment(attachment);
         if (ws.deserializeAttachment()?.public === true) {
           const setting = await this.env.DB.prepare("SELECT value FROM probe_settings WHERE key = 'is_public'").first();
           if (setting && setting.value !== "true") {
@@ -490,7 +516,7 @@ export class DashboardHub extends DurableObject {
   }
 
   async setDashboardActivity(active) {
-    const until = active ? Date.now() + 300000 : 0;
+    const until = active ? Date.now() + VIEWER_LEASE_MS : 0;
     if (active && this.activityUntil - Date.now() > 60000) return;
     this.activityUntil = until;
     const servers = (await this.env.DB.prepare("SELECT ip FROM servers").all()).results || [];
@@ -521,6 +547,10 @@ export class DashboardHub extends DurableObject {
       else if (!next || value.expires < next) next = value.expires;
     }
     if (expired.length) await this.ctx.storage.delete(expired);
+    const nowActive = Date.now();
+    for (const ws of this.ctx.getWebSockets()) if (!viewerActive(ws.deserializeAttachment(), nowActive)) { try { ws.close(1001, "activity timeout"); } catch {} }
+    const hasActiveViewers = [...this.ctx.getWebSockets()].some(ws => viewerActive(ws.deserializeAttachment(), nowActive));
+    if (!hasActiveViewers) await this.setDashboardActivity(false);
     const publicSockets = this.ctx.getWebSockets("public");
     if (publicSockets.length) {
       const setting = await this.env.DB.prepare("SELECT value FROM probe_settings WHERE key = 'is_public'").first();
@@ -529,10 +559,11 @@ export class DashboardHub extends DurableObject {
           try { ws.close(1008, "private dashboard"); } catch {}
         }
       } else {
-        const publicCheck = Date.now() + 60000;
+        const publicCheck = Date.now() + 30000;
         if (!next || publicCheck < next) next = publicCheck;
       }
     }
+    if (hasActiveViewers) { const viewerCheck = Date.now() + 30000; if (!next || viewerCheck < next) next = viewerCheck; }
     if (next) await this.ctx.storage.setAlarm(next + 5000);
   }
 }

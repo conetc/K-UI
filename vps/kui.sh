@@ -44,6 +44,14 @@ case "$OS" in
     *) echo "不支持的发行版: $OS"; exit 1 ;;
 esac
 
+detect_init_system() {
+    if [ -d /run/systemd/system ] && [ "$(cat /proc/1/comm 2>/dev/null || true)" = "systemd" ] && command -v systemctl >/dev/null 2>&1; then echo systemd
+    elif [ -x /sbin/openrc-run ] && command -v rc-service >/dev/null 2>&1; then echo openrc
+    else echo none; fi
+}
+INIT_SYS=$(detect_init_system)
+[ "$INIT_SYS" != none ] || { echo "❌ 需要正在运行的 systemd 或 OpenRC"; exit 1; }
+
 INSTALL_SUCCESS=0
 BACKUP_DIR=$(mktemp -d /tmp/kui-install-backup.XXXXXX)
 chmod 700 "$BACKUP_DIR"
@@ -57,12 +65,12 @@ rollback_install() {
     status=$?
     if [ "$INSTALL_SUCCESS" -ne 1 ]; then
         echo "❌ 安装未完成，正在恢复上一个可用版本..."
-        if [ "$OS" = "alpine" ]; then rc-service kui-agent stop >/dev/null 2>&1 || true; rc-service sing-box stop >/dev/null 2>&1 || true; rc-service proxy-lite stop >/dev/null 2>&1 || true
+        if [ "$INIT_SYS" = "openrc" ]; then rc-service kui-agent stop >/dev/null 2>&1 || true; rc-service sing-box stop >/dev/null 2>&1 || true; rc-service proxy-lite stop >/dev/null 2>&1 || true
         else systemctl stop kui-agent sing-box proxy-lite >/dev/null 2>&1 || true; fi
         rm -rf /opt/kui /etc/sing-box /opt/proxy_lite /etc/proxy-lite
         rm -f /usr/bin/sing-box /etc/systemd/system/kui-agent.service /etc/systemd/system/sing-box.service /etc/systemd/system/proxy-lite.service /etc/init.d/kui-agent /etc/init.d/sing-box /etc/init.d/proxy-lite /etc/conf.d/proxy-lite
         [ ! -f "$BACKUP_DIR/system.tgz" ] || tar -C / -xzf "$BACKUP_DIR/system.tgz"
-        if [ "$OS" = "alpine" ]; then rc-service kui-agent start >/dev/null 2>&1 || true; rc-service sing-box start >/dev/null 2>&1 || true; rc-service proxy-lite start >/dev/null 2>&1 || true
+        if [ "$INIT_SYS" = "openrc" ]; then rc-service kui-agent start >/dev/null 2>&1 || true; rc-service sing-box start >/dev/null 2>&1 || true; rc-service proxy-lite start >/dev/null 2>&1 || true
         else systemctl daemon-reload >/dev/null 2>&1 || true; systemctl start kui-agent sing-box proxy-lite >/dev/null 2>&1 || true; fi
     fi
     rm -rf "$BACKUP_DIR"
@@ -78,7 +86,7 @@ echo "=========================================="
 export CURL_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
 echo "[1/7] 🧹 正在清理历史残留..."
-if [ "$OS" = "alpine" ]; then
+if [ "$INIT_SYS" = "openrc" ]; then
     rc-service kui-agent stop >/dev/null 2>&1 || true
     rc-service sing-box stop >/dev/null 2>&1 || true
     rc-update del kui-agent default >/dev/null 2>&1 || true
@@ -93,7 +101,7 @@ fi
 rm -rf /opt/kui /etc/sing-box/config.json
 
 echo "[2/7] ⚡ 保留系统现有软件源..."
-if [ "$OS" = "alpine" ]; then
+if [ "$INIT_SYS" = "openrc" ]; then
     :
 else
     :
@@ -101,7 +109,7 @@ fi
 
 echo "[3/7] 📦 正在安装底层网络依赖..."
 ALIYUN_OK=0
-if [ "$OS" = "alpine" ]; then
+if [ "$INIT_SYS" = "openrc" ]; then
     apk update || echo "⚠️ apk update 失败，尝试使用现有缓存安装。"
     apk add python3 py3-websocket-client curl openssl iptables coreutils bash tar libc6-compat gcompat iproute2
 else
@@ -182,13 +190,23 @@ fi
 API_URL="$API_URL" VPS_IP="$VPS_IP" TOKEN="$TOKEN" PROXY_API_URL="${PROXY_API_URL:-}" python3 -c 'import json, os; json.dump({"api_url": os.environ["API_URL"] + "/api/config", "report_url": os.environ["API_URL"] + "/api/report", "ip": os.environ["VPS_IP"], "token": os.environ["TOKEN"], "proxy_api": os.environ["PROXY_API_URL"]}, open("/opt/kui/config.json", "w"))'
 chmod 600 /opt/kui/config.json
 
+verify_agent_manifest() {
+    component="$1"; file="$2"; headers="$3"
+    expected_sha=$(tr -d '\r' < "$headers" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
+    version=$(tr -d '\r' < "$headers" | awk '/^[Xx]-[Aa]gent-[Mm]anifest-[Vv]ersion:/ {print $2}' | tail -n 1)
+    expected_length=$(tr -d '\r' < "$headers" | awk '/^[Xx]-[Aa]gent-[Ll]ength:/ {print $2}' | tail -n 1)
+    supplied_mac=$(tr -d '\r' < "$headers" | awk '/^[Xx]-[Aa]gent-[Mm][Aa][Cc]:/ {print tolower($2)}' | tail -n 1)
+    actual_sha=$(sha256sum "$file" | awk '{print $1}')
+    actual_length=$(wc -c < "$file" | tr -d ' ')
+    expected_mac=$(printf 'v1\n%s\n%s\n%s\n' "$component" "$expected_sha" "$actual_length" | openssl dgst -sha256 -mac HMAC -macopt "key:${TOKEN}" | awk '{print tolower($NF)}')
+    [ "$version" = "1" ] && [ "$expected_length" = "$actual_length" ] && [ -n "$expected_sha" ] && [ "$expected_sha" = "$actual_sha" ] && [ -n "$supplied_mac" ] && [ "$supplied_mac" = "$expected_mac" ]
+}
+
 echo "正在拉取最新版 Agent 执行器..."
 AGENT_URL="${API_URL}/api/agent_update?ip=${VPS_IP}&component=agent"
 AGENT_TEMP="/opt/kui/agent.py.download"; AGENT_HEADERS="/opt/kui/agent.py.headers"
 curl -fsSL --retry 3 --retry-delay 2 -A "$CURL_USER_AGENT" -D "$AGENT_HEADERS" -H "Authorization: ${TOKEN}" "$AGENT_URL" -o "$AGENT_TEMP"
-EXPECTED_AGENT_SHA=$(tr -d '\r' < "$AGENT_HEADERS" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
-ACTUAL_AGENT_SHA=$(sha256sum "$AGENT_TEMP" | awk '{print $1}')
-[ -n "$EXPECTED_AGENT_SHA" ] && [ "$EXPECTED_AGENT_SHA" = "$ACTUAL_AGENT_SHA" ] || { echo "❌ agent.py SHA256 校验失败"; exit 1; }
+verify_agent_manifest agent "$AGENT_TEMP" "$AGENT_HEADERS" || { echo "❌ agent.py 更新清单校验失败"; exit 1; }
 python3 -m py_compile "$AGENT_TEMP"
 mv "$AGENT_TEMP" /opt/kui/agent.py
 rm -f "$AGENT_HEADERS"
@@ -197,9 +215,7 @@ chmod 700 /opt/kui/agent.py
 REALTIME_CLIENT_URL="${API_URL}/api/agent_update?ip=${VPS_IP}&component=realtime-client"
 REALTIME_CLIENT_TEMP="/opt/kui/realtime_client.py.download"; REALTIME_CLIENT_HEADERS="/opt/kui/realtime_client.py.headers"
 curl -fsSL --retry 3 --retry-delay 2 -A "$CURL_USER_AGENT" -D "$REALTIME_CLIENT_HEADERS" -H "Authorization: ${TOKEN}" "$REALTIME_CLIENT_URL" -o "$REALTIME_CLIENT_TEMP"
-EXPECTED_REALTIME_SHA=$(tr -d '\r' < "$REALTIME_CLIENT_HEADERS" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
-ACTUAL_REALTIME_SHA=$(sha256sum "$REALTIME_CLIENT_TEMP" | awk '{print $1}')
-[ -n "$EXPECTED_REALTIME_SHA" ] && [ "$EXPECTED_REALTIME_SHA" = "$ACTUAL_REALTIME_SHA" ] || { echo "❌ realtime_client.py SHA256 校验失败"; exit 1; }
+verify_agent_manifest realtime-client "$REALTIME_CLIENT_TEMP" "$REALTIME_CLIENT_HEADERS" || { echo "❌ realtime_client.py 更新清单校验失败"; exit 1; }
 python3 -m py_compile "$REALTIME_CLIENT_TEMP"
 mv "$REALTIME_CLIENT_TEMP" /opt/kui/realtime_client.py
 rm -f "$REALTIME_CLIENT_HEADERS"
@@ -299,13 +315,10 @@ PROXY_INSTALLER_TEMP="/opt/kui/residential-proxy.sh.download"; PROXY_INSTALLER_H
 cleanup_proxy_installer() { rm -f "$PROXY_INSTALLER_TEMP" "$PROXY_INSTALLER_HEADERS"; }
 curl -fsSL --retry 3 --retry-delay 2 -A "$CURL_USER_AGENT" -D "$PROXY_INSTALLER_HEADERS" -H "Authorization: ${TOKEN}" "$PROXY_INSTALLER_URL" -o "$PROXY_INSTALLER_TEMP"
 EXPECTED_INSTALLER_SHA=$(tr -d '\r' < "$PROXY_INSTALLER_HEADERS" | awk '/^[Xx]-[Aa]gent-[Ss][Hh][Aa]256:/ {print tolower($2)}' | tail -n 1)
-PROXY_CONTROLLER_MODE=$(tr -d '\r' < "$PROXY_INSTALLER_HEADERS" | awk '/^[Xx]-[Pp]roxy-[Cc]ontroller-[Mm]ode:/ {print tolower($2)}' | tail -n 1)
-[ "$PROXY_CONTROLLER_MODE" != "external" ] || { echo "❌ 当前配置使用外部住宅控制器，请使用其专用凭据单独部署住宅组件。"; exit 1; }
-ACTUAL_INSTALLER_SHA=$(sha256sum "$PROXY_INSTALLER_TEMP" | awk '{print $1}')
-[ -n "$EXPECTED_INSTALLER_SHA" ] && [ "$EXPECTED_INSTALLER_SHA" = "$ACTUAL_INSTALLER_SHA" ] || { echo "❌ residential-proxy.sh SHA256 校验失败"; exit 1; }
+verify_agent_manifest proxy-installer "$PROXY_INSTALLER_TEMP" "$PROXY_INSTALLER_HEADERS" || { echo "❌ residential-proxy.sh 更新清单校验失败"; exit 1; }
 bash -n "$PROXY_INSTALLER_TEMP"
 chmod 700 "$PROXY_INSTALLER_TEMP"
-bash "$PROXY_INSTALLER_TEMP" --domain "$API_URL" --controller "$API_URL" --ip "$VPS_IP" --token "$TOKEN"
+bash "$PROXY_INSTALLER_TEMP" --domain "$API_URL" --controller "${PROXY_API_URL:-$API_URL}" --ip "$VPS_IP" --token "$TOKEN"
 cleanup_proxy_installer
 INSTALL_SUCCESS=1
 rm -rf "$BACKUP_DIR"

@@ -960,6 +960,7 @@
         
         const sha256 = async (text) => { const buffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)); return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join(''); };
         const generateHMAC = async (keyHex, message) => { const keyBytes = new Uint8Array(keyHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16))); const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)); return Array.from(new Uint8Array(signature)).map(b => b.toString(16).padStart(2, '0')).join(''); };
+        const signedAuthHeader = async (keyHex, username, method, path) => { const timestamp = Date.now().toString(); const nonce = crypto.randomUUID(); const signature = await generateHMAC(keyHex, `${username}\n${timestamp}\n${nonce}\n${method}\n${new URL(path, location.origin).pathname}`); return `${btoa(username)}.${timestamp}.${nonce}.${signature}`; };
         const toBase64Url = (uint8Array) => { let str = ''; for (let i = 0; i < uint8Array.length; i++) str += String.fromCharCode(uint8Array[i]); return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''); };
         const generateRealityKeys = () => { const keypair = nacl.box.keyPair(); return { privateKey: toBase64Url(keypair.secretKey), publicKey: toBase64Url(keypair.publicKey), shortId: crypto.randomUUID().replace(/-/g, '').substring(0, 16) }; };
 
@@ -1121,8 +1122,7 @@
                 let authGeneration = 0;
                 const fetchApi = async (url, options = {}) => {
                     const generation = authGeneration; const requestUser = currentUser.value; const requestKey = authKey.value;
-                    const timestamp = Date.now().toString(); const signature = await generateHMAC(requestKey, requestUser + timestamp);
-                    options.headers = { ...options.headers, 'Authorization': `${btoa(requestUser)}.${timestamp}.${signature}` };
+                    options.headers = { ...options.headers, 'Authorization': `Bearer ${requestKey}` };
                     const res = await fetch(url, options);
                     if (generation !== authGeneration || requestUser !== currentUser.value) throw new Error('Stale session response');
                     if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
@@ -1142,20 +1142,17 @@
                 };
                 window.kuiAdminAuthHeader = async () => {
                     if (!authKey.value || !currentUser.value || role.value !== 'admin') return {};
-                    const timestamp = Date.now().toString();
-                    const signature = await generateHMAC(authKey.value, currentUser.value + timestamp);
-                    return { 'Authorization': `${btoa(currentUser.value)}.${timestamp}.${signature}` };
+                    return { 'Authorization': `Bearer ${authKey.value}` };
                 };
                 window.kuiManagedServerIps = () => servers.value.map(server => server.ip).filter(Boolean);
 
                 const login = async () => {
                     if (!loginUser.value) loginUser.value = 'admin';
                     try {
-                        const hashedPass = await sha256(password.value); const timestamp = Date.now().toString(); const sig = await generateHMAC(hashedPass, loginUser.value + timestamp);
-                        const res = await fetch('/api/login', { method: 'POST', headers: { 'Authorization': `${btoa(loginUser.value)}.${timestamp}.${sig}` } });
+                        const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: loginUser.value, password: password.value }) });
                         if (res.ok) {
                             authGeneration++;
-                            const data = await res.json(); authKey.value = hashedPass; currentUser.value = loginUser.value; role.value = data.role;
+                            const data = await res.json(); authKey.value = data.token; currentUser.value = loginUser.value; role.value = data.role;
                             localStorage.setItem('kui_auth_key', authKey.value); localStorage.setItem('kui_user', currentUser.value); localStorage.setItem('kui_role', role.value);
                             isLoggedIn.value = true; showLoginModal.value = false; password.value = ''; const publicSocket = publicRealtimeSocket; publicRealtimeSocket = null; publicSocket?.close(); clearTimeout(publicRealtimeReconnectTimer); clearTimeout(publicRealtimeFallbackTimer); clearInterval(publicRealtimeActivityTimer);
                             activeTab.value = role.value === 'admin' ? 'nodes' : 'dashboard';
@@ -1245,7 +1242,7 @@
                     if (!detailRequest) isFetchingProbe = true;
                     try {
                         let authHeader = {};
-                        if (isLoggedIn.value) { const ts = Date.now().toString(); authHeader = {'Authorization': `${btoa(currentUser.value)}.${ts}.${await generateHMAC(authKey.value, currentUser.value + ts)}`}; }
+                        if (isLoggedIn.value) authHeader = { 'Authorization': `Bearer ${authKey.value}` };
                         
                         if (probeDetailId.value) {
                             const requestedId = probeDetailId.value;
@@ -1608,7 +1605,7 @@
                     publicRealtimeSocket = socket;
                     clearTimeout(publicRealtimeConnectTimer);
                     publicRealtimeConnectTimer = setTimeout(() => { if (publicRealtimeSocket === socket && socket.readyState === WebSocket.CONNECTING) socket.close(); }, 30000);
-                    socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); clearTimeout(publicRealtimeConnectTimer); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); };
+                    socket.onopen = () => { if (publicRealtimeSocket !== socket) return socket.close(); clearTimeout(publicRealtimeConnectTimer); publicRealtimeDisconnectedAt = 0; publicRealtimeRetryDelay = 10000; clearTimeout(publicRealtimeFallbackTimer); stopProbePolling(); clearInterval(publicRealtimeActivityTimer); socket.send(JSON.stringify({ type: 'activity' })); publicRealtimeActivityTimer = setInterval(() => { if (publicRealtimeSocket === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'activity' })); }, 30000); };
                     socket.onmessage = event => { if (publicRealtimeSocket !== socket) return; try { const message = JSON.parse(event.data); if (message.type === 'snapshot') (message.data || []).forEach(applyRealtimeSnapshot); else if (message.type === 'patch') applyRealtimeSnapshot(message.data); } catch(e) {} };
                     socket.onclose = event => { if (publicRealtimeSocket !== socket) return; clearTimeout(publicRealtimeConnectTimer); publicRealtimeSocket = null; clearInterval(publicRealtimeActivityTimer); if (event.code === 1008) { clearTimeout(publicRealtimeReconnectTimer); stopProbePolling(); publicProbeServers.value = []; probeSys.is_public = 'false'; return; } if (!publicRealtimeDisconnectedAt) publicRealtimeDisconnectedAt = Date.now(); clearTimeout(publicRealtimeFallbackTimer); publicRealtimeFallbackTimer = setTimeout(() => { if (!document.hidden && !isLoggedIn.value) startProbePolling(); }, Math.max(0, 30000 - (Date.now() - publicRealtimeDisconnectedAt))); clearTimeout(publicRealtimeReconnectTimer); const delay = publicRealtimeRetryDelay; publicRealtimeRetryDelay = Math.min(publicRealtimeRetryDelay * 2, 60000); publicRealtimeReconnectTimer = setTimeout(connectPublicRealtime, delay); };
                     socket.onerror = () => socket.close();
@@ -1671,18 +1668,16 @@
             return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
 
-        async function getPcAuthHeader() {
+        async function getPcAuthHeader(method, path) {
             const user = localStorage.getItem('kui_user') || 'admin';
             const key = localStorage.getItem('kui_auth_key') || '';
             if (!key) return '';
-            const ts = Date.now();
-            const sig = await generateHMAC(key, user + ts);
-            return `${btoa(user)}.${ts}.${sig}`;
+            return `Bearer ${key}`;
         }
 
         async function pcFetchCountries() {
             try {
-                const auth = await getPcAuthHeader();
+                const auth = await getPcAuthHeader('GET', '/api/proxy/countries');
                 const res = await fetch('/api/proxy/countries', { headers: { 'Authorization': auth } });
                 const list = await res.json();
                 const container = document.getElementById('countries-list');
@@ -1693,7 +1688,7 @@
 
         async function pcLoadConfig() {
             try {
-                const auth = await getPcAuthHeader();
+                const auth = await getPcAuthHeader('GET', '/api/proxy/config');
                 const res = await fetch('/api/proxy/config', { headers: { 'Authorization': auth } });
                 if (!res.ok) { const err = await res.text(); throw new Error(err || res.status); }
                 const map = await res.json();
@@ -1709,11 +1704,11 @@
             const val = document.getElementById(`slot-cfg-0`).value.toUpperCase().trim() || 'JP';
             const port = parseInt(document.getElementById(`slot-port`).value) || 7920;
             try {
-                const auth = await getPcAuthHeader();
                 const targets = window.kuiManagedServerIps?.() || [];
                 if (!targets.length) throw new Error('暂无已接入 VPS');
                 let text = '';
                 for (const ip of targets) {
+                    const auth = await getPcAuthHeader('POST', '/api/proxy/config');
                     const res = await fetch('/api/proxy/config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth }, body: JSON.stringify({ ip, "0": val, "country": val, "port": port }) });
                     text = await res.text();
                     if (!res.ok) throw new Error(text || res.status);
@@ -1736,11 +1731,11 @@
             const val = document.getElementById(`slot-cfg-0`).value.toUpperCase().trim() || 'JP';
             const port = parseInt(document.getElementById(`slot-port`).value) || 7920;
             try {
-                const auth = await getPcAuthHeader();
                 const targets = window.kuiManagedServerIps?.() || [];
                 if (!targets.length) throw new Error('暂无已接入 VPS');
                 const trigger = Date.now();
                 for (const ip of targets) {
+                    const auth = await getPcAuthHeader('POST', '/api/proxy/config');
                     const res = await fetch('/api/proxy/config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': auth }, body: JSON.stringify({ ip, "0": val, "country": val, "port": port, "switch_trigger": trigger }) });
                     if (!res.ok) { const err = await res.text(); throw new Error(err || res.status); }
                     window.kuiNotifyRealtime?.(ip);
@@ -1839,7 +1834,7 @@
                 let servers = [];
                 const realtimeSnapshots = Object.values(window.kuiRealtimeProxySnapshots || {});
                 if (!window.kuiRealtimeConnected) {
-                    const auth = await getPcAuthHeader();
+                    const auth = await getPcAuthHeader('GET', '/api/proxy/nodes');
                     const res = await fetch(`/api/proxy/nodes?t=${Date.now()}`, { headers: { 'Authorization': auth } });
                     pcHttpServers = await res.json(); lastPcHttpFetch = Date.now();
                 }

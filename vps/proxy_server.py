@@ -33,6 +33,7 @@ ACTIVE_BIND = "tun_main"
 MAX_CONNECTIONS = max(16, int(os.environ.get("PROXY_MAX_CONNECTIONS", "256")))
 RELAY_IDLE_TIMEOUT = max(60, int(os.environ.get("PROXY_IDLE_TIMEOUT", "600")))
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
+listener_ready = threading.Event()
 
 def parse_int(value: Any) -> int:
     try: return int(value)
@@ -274,6 +275,7 @@ def start_proxy_server(host: str, port: int) -> None:
         except Exception: pass
     if not servers:
         raise OSError(f"unable to bind proxy port {port} on IPv4 or IPv6")
+    listener_ready.set()
     while True:
         try:
             readable, _, _ = select.select(servers, [], [], 1.0)
