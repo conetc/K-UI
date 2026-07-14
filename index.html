@@ -783,9 +783,16 @@
                             <label class="block text-xs font-bold text-slate-400 mb-2 pl-2">控制面板全局名称</label>
                             <div class="flex gap-3"><input v-model="siteTitleInput" placeholder="Cluster Gateway" class="w-full bg-white/50 border border-white p-3 rounded-2xl transition hover:bg-white focus:bg-white text-sm font-medium"><button @click="saveSiteTitle" class="bg-indigo-600 text-white px-6 py-3 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-md whitespace-nowrap">保存更改</button></div>
                         </div>
-                        <div>
+                        <div class="flex flex-col gap-3">
                             <label class="block text-xs font-bold text-slate-400 mb-2 pl-2">管理员订阅防泄漏重置</label>
-                            <button @click="resetMySubLink" class="bg-rose-50 text-rose-600 border border-rose-100 px-6 py-3 rounded-2xl font-bold hover:bg-rose-100 transition-all shadow-sm">⚠️ 一键重置我的订阅令牌</button>
+                            <div class="flex flex-wrap items-center gap-3">
+                                <button @click="resetMySubLink" class="bg-rose-50 text-rose-600 border border-rose-100 px-6 py-3 rounded-2xl font-bold hover:bg-rose-100 transition-all shadow-sm">⚠️ 一键重置我的订阅令牌</button>
+                                <label class="flex items-center gap-2 rounded-2xl border px-4 py-3 text-sm font-bold cursor-pointer transition-colors" :class="probeSys.subscription_protection === 'true' ? 'border-amber-300 bg-amber-50 text-amber-700' : 'border-slate-200 bg-white/60 text-slate-600'">
+                                    <input type="checkbox" v-model="probeSys.subscription_protection" true-value="true" false-value="false" class="w-4 h-4">
+                                    订阅保护{{ probeSys.subscription_protection === 'true' ? '已开启' : '已关闭' }}
+                                </label>
+                            </div>
+                            <p class="text-[10px] font-medium text-slate-500">开启后订阅请求返回普通首页内容，停止在线更新；修改后点击下方“立即生效配置”保存。</p>
                         </div>
                     </div>
 
@@ -830,11 +837,6 @@
                                 <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" v-model="probeSys.show_tf" true-value="true" false-value="false" class="w-4 h-4"> 显示流量配额徽章</label>
                                 <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" v-model="probeSys.enable_popup" true-value="true" false-value="false" class="w-4 h-4"> 开启首页访问公告弹窗 (支持HTML)</label>
                                 <div v-if="probeSys.enable_popup === 'true'"><textarea v-model="probeSys.popup_content" rows="4" class="w-full bg-white/50 border p-2.5 rounded-xl text-sm" placeholder="<h3>公告</h3><p>内容...</p>"></textarea></div>
-
-                                <div class="rounded-xl border border-rose-200 bg-rose-50 p-3">
-                                    <label class="flex items-center gap-2 text-sm font-bold text-rose-700 cursor-pointer"><input type="checkbox" v-model="probeSys.subscription_protection" true-value="true" false-value="false" class="w-4 h-4"> 开启订阅保护</label>
-                                    <p class="mt-1 text-[10px] font-medium text-rose-600">开启后，所有在线订阅更新请求都会返回“链接无效”，可阻止爬虫拉取；关闭后恢复正常订阅更新。修改后点击下方“立即生效配置”保存。</p>
-                                </div>
 
                                 <label class="block text-sm font-bold text-blue-600 mt-6 mb-2">📡 动态下发三网测速节点配置</label>
                                 <div><label class="block text-xs font-bold text-slate-500 mb-1">电信 (CT)</label>
