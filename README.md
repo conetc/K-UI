@@ -318,7 +318,7 @@ Workers & Pages → kui-realtime → Settings → Variables and Secrets
 
 如果无法使用本地 Node.js，可以使用按钮：
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/K-UI/tree/dev/realtime)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/K-UI/tree/main/realtime)
 
 部署时确认 Worker 名称为：
 
